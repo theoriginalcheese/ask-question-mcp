@@ -8,7 +8,10 @@ PyGObject). Freeform ``Something else`` / ``opens_entry`` options use
 
 Windows: prefer frameless Nebula WebView2 (``win_webview_ask.py``, theme
 ``glass`` by default); then Edge ``--app`` (``win_edge_ask.py``); then
-tkinter. Override with ``ASK_QUESTION_WIN_UI=pywebview|edge|tk|auto`` and
+tkinter only if forced (``ASK_QUESTION_WIN_UI=tk``) or opted in after a
+blank (``ASK_QUESTION_WIN_FALLBACK=tk``). Blank WebView/Edge retries once;
+it does **not** silently open the plain tk “feather” dialog. Override with
+``ASK_QUESTION_WIN_UI=pywebview|edge|tk|auto`` and
 ``ASK_QUESTION_THEME=glass|ink|signal|hybrid``.
 
 Recommended options are listed first and pre-selected. Dangerous decisions
@@ -748,7 +751,10 @@ def _ask_list(
         except AskCancelled:
             raise
 
-        # Edge/WebView blank → fall back to tk so Cursor never sits on a dead HWND.
+        # Edge/WebView blank → retry same Nebula/Edge backend once (brief pause
+        # so a hard os._exit teardown can finish). Do **not** auto-swap to
+        # tkinter — that shows the plain "feather" Windows dialog and looks
+        # like a different product. Opt in with ASK_QUESTION_WIN_FALLBACK=tk.
         blank = False
         if list_script in {_WIN_WEBVIEW_ASK, _WIN_EDGE_ASK}:
             if not (raw or "").strip():
@@ -765,23 +771,52 @@ def _ask_list(
                 except json.JSONDecodeError:
                     blank = True
         if blank:
-            # An explicit ASK_QUESTION_WIN_UI choice is honoured on retry —
-            # silently swapping in the tk dialog changes the look mid-session.
-            retry_script = (
-                _WIN_LIST_ASK
-                if _win_ui_preference() == "auto" and _WIN_LIST_ASK.is_file()
-                else list_script
-            )
+            time.sleep(0.6)
             try:
                 raw, rc, err = _run_win_dialog(
                     win_py,
-                    retry_script,
+                    list_script,
                     payload,
                     timeout_sec=timeout_sec,
                     grace_sec=15,
                 )
             except AskCancelled:
                 raise
+            # Second blank? Only then allow explicit tk opt-in.
+            still_blank = False
+            if not (raw or "").strip():
+                still_blank = True
+            else:
+                try:
+                    probe2 = json.loads(raw)
+                    reason2 = str(probe2.get("reason") or "").casefold()
+                    if probe2.get("cancelled") and (
+                        "blank" in reason2
+                        or "failed to load" in reason2
+                        or "edge not found" in reason2
+                    ):
+                        still_blank = True
+                except json.JSONDecodeError:
+                    still_blank = True
+            allow_tk = os.environ.get(
+                "ASK_QUESTION_WIN_FALLBACK", ""
+            ).strip().lower() in {"1", "true", "yes", "on", "tk", "tkinter"}
+            if (
+                still_blank
+                and allow_tk
+                and _WIN_LIST_ASK.is_file()
+                and list_script != _WIN_LIST_ASK
+            ):
+                try:
+                    raw, rc, err = _run_win_dialog(
+                        win_py,
+                        _WIN_LIST_ASK,
+                        payload,
+                        timeout_sec=timeout_sec,
+                        grace_sec=15,
+                    )
+                except AskCancelled:
+                    raise
 
         if not raw:
             detail = (err or "").strip() or f"exit {rc} script={list_script.name}"

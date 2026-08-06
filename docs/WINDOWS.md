@@ -14,6 +14,8 @@ Canonical install steps: this file (and a one-line pointer from the
 | 2 | tkinter | Fallback (`win_list_ask.py`) if pywebview missing |
 
 Force with env: `ASK_QUESTION_WIN_UI=webview` or `ASK_QUESTION_WIN_UI=tk`.
+Blank WebView/Edge retries the same backend once; set `ASK_QUESTION_WIN_FALLBACK=tk`
+only if you want the plain feather/tk window after a second blank.
 
 ## Checklist for Anthony
 
@@ -57,7 +59,7 @@ Manual mcp.json edit is still fine if you skip the installer — use absolute
 | Image / images preview | No (ignored; text-only for now) |
 | 1–8 hotkeys + Enter / Esc | Yes |
 | Remember size/position | Yes (`prefs.window`) |
-| Aesthetic | Nebula glass WebView2 (frameless); tk fallback; optional Edge `--app` |
+| Aesthetic | Nebula glass WebView2 (frameless); optional Edge `--app`; tk only if `ASK_QUESTION_WIN_UI=tk` or `ASK_QUESTION_WIN_FALLBACK=tk` (no silent feather fallback) |
 
 ## Out of scope
 

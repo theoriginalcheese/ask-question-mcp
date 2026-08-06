@@ -112,7 +112,7 @@ def resolve_voice_capabilities(*, speak_requested: bool) -> VoiceCapabilities:
     # Windows: Nebula WebView2 text MCQ — no duck / STT / local speak path yet.
     if sys.platform == "win32":
         win_notes = [
-            "Windows: text-only MCQ (frameless Nebula WebView2; tk/Edge fallback) "
+            "Windows: text-only MCQ (frameless Nebula WebView2; Edge optional; tk only if forced) "
             "— speak/listen not supported yet.",
         ]
         if tts or stt:
