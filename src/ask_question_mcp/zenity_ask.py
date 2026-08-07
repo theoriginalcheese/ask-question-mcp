@@ -8,8 +8,8 @@ PyGObject). Freeform ``Something else`` / ``opens_entry`` options use
 
 Windows: prefer frameless Nebula WebView2 (``win_webview_ask.py``, theme
 ``glass`` by default); then Edge ``--app`` (``win_edge_ask.py``); then
-tkinter only if forced (``ASK_QUESTION_WIN_UI=tk``) or opted in after a
-blank (``ASK_QUESTION_WIN_FALLBACK=tk``). Blank WebView/Edge retries once;
+tkinter only if forced (``ASK_QUESTION_WIN_UI=tk``) or opted in after a blank
+(``ASK_QUESTION_WIN_FALLBACK=tk``). Blank WebView/Edge retries once;
 it does **not** silently open the plain tk “feather” dialog. Override with
 ``ASK_QUESTION_WIN_UI=pywebview|edge|tk|auto`` and
 ``ASK_QUESTION_THEME=glass|ink|signal|hybrid``.
@@ -107,20 +107,27 @@ def _run_win_dialog(
     Returns ``(stdout, returncode, stderr)``. Do **not** use
     ``CREATE_BREAKAWAY_FROM_JOB`` — that orphaned the GUI under Cursor MCP
     (parent saw empty exit 0 while the dialog kept freezing the desktop).
+
+    Soft idle timeout is the child's job. If the human starts typing/paste,
+    the child touches ``{result_path}.engaged`` and the parent extends the
+    kill deadline so the dialog stays open until submit/cancel.
     """
     result_path = (
         Path(os.environ.get("TEMP") or os.environ.get("TMP") or ".")
         / f"ask-question-mcp-result-{os.getpid()}-{id(payload)}.json"
     )
-    try:
-        if result_path.is_file():
-            result_path.unlink()
-    except OSError:
-        pass
+    engaged_path = Path(str(result_path) + ".engaged")
+    for path in (result_path, engaged_path):
+        try:
+            if path.is_file():
+                path.unlink()
+        except OSError:
+            pass
 
     body = dict(payload)
     body["result_path"] = str(result_path)
-    wait = (timeout_sec + grace_sec) if timeout_sec > 0 else None
+    # Absolute ceiling after engagement (~4h) so a stuck child cannot hang MCP.
+    engaged_abs_sec = 4 * 60 * 60
     proc = subprocess.Popen(
         [win_py, "-u", str(script)],
         stdin=subprocess.PIPE,
@@ -132,20 +139,57 @@ def _run_win_dialog(
         # (breakaway orphaned dialogs under Cursor and froze the UI).
         creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
     )
+    assert proc.stdin is not None
     try:
-        stdout, stderr = proc.communicate(
-            input=json.dumps(body),
-            timeout=wait,
-        )
-    except subprocess.TimeoutExpired:
-        _kill_process_tree(proc.pid)
+        proc.stdin.write(json.dumps(body))
+        proc.stdin.close()
+    except OSError:
+        pass
+
+    started = time.monotonic()
+    idle_deadline = (
+        started + float(timeout_sec + grace_sec) if timeout_sec > 0 else None
+    )
+    absolute = started + float(engaged_abs_sec)
+    stdout = ""
+    stderr = ""
+    try:
+        while proc.poll() is None:
+            now = time.monotonic()
+            engaged = engaged_path.is_file()
+            if engaged:
+                if now >= absolute:
+                    _kill_process_tree(proc.pid)
+                    try:
+                        stdout, stderr = proc.communicate(timeout=5)
+                    except (subprocess.TimeoutExpired, ValueError, OSError):
+                        stdout, stderr = "", ""
+                    raise AskCancelled(
+                        f"Windows dialog engaged absolute timeout "
+                        f"(killed pid={proc.pid} script={script.name})"
+                    ) from None
+            elif idle_deadline is not None and now >= idle_deadline:
+                _kill_process_tree(proc.pid)
+                try:
+                    stdout, stderr = proc.communicate(timeout=5)
+                except (subprocess.TimeoutExpired, ValueError, OSError):
+                    stdout, stderr = "", ""
+                raise AskCancelled(
+                    f"Windows dialog timed out "
+                    f"(killed pid={proc.pid} script={script.name})"
+                ) from None
+            time.sleep(0.25)
         try:
             stdout, stderr = proc.communicate(timeout=5)
         except (subprocess.TimeoutExpired, ValueError, OSError):
-            stdout, stderr = "", ""
-        raise AskCancelled(
-            f"Windows dialog timed out (killed pid={proc.pid} script={script.name})"
-        ) from None
+            stdout, stderr = stdout or "", stderr or ""
+    finally:
+        for path in (engaged_path,):
+            try:
+                if path.is_file():
+                    path.unlink()
+            except OSError:
+                pass
 
     raw = (stdout or "").strip()
     if not raw and result_path.is_file():
@@ -401,7 +445,7 @@ def _resolve_win_list_script(win_py: str) -> Path:
             raise RuntimeError(f"tkinter unavailable on {win_py}: {detail}")
         return _WIN_LIST_ASK
 
-    # auto: frameless WebView2 → Edge --app → tk
+    # auto: frameless WebView2 Nebula first; Edge --app; then tk if forced path.
     if _WIN_WEBVIEW_ASK.is_file():
         wv_ok, _ = _probe_webview(win_py)
         if wv_ok:
@@ -708,12 +752,13 @@ def _ask_list(
     audio_mode: str = "text_only",
     capability_notes: list[str] | None = None,
     images: list[str] | None = None,
-) -> tuple[list[str], dict[str, Any], str | None]:
+) -> tuple[list[str], dict[str, Any], str | None, list[Any]]:
     """Radiolist/checklist via Gtk (Linux) or WebView2/tk (Windows).
 
-    Returns ``(chosen_ids, voice_meta, freeform_text_or_None)``. When the
-    dialog already confirmed a spoken/typed freeform answer, ``freeform_text``
-    is set and the entry step is skipped.
+    Returns ``(chosen_ids, voice_meta, freeform_text_or_None, pasted_images)``.
+    When the dialog already confirmed a spoken/typed freeform answer,
+    ``freeform_text`` is set and the entry step is skipped. ``pasted_images``
+    is the raw bridge payload (base64 objects) when the human pasted stills.
     """
     image_paths = [str(p) for p in (images or []) if str(p).strip()]
     rec_ids = sorted(recommended or set())
@@ -844,6 +889,9 @@ def _ask_list(
             freeform_text = freeform_text.strip() or None
         else:
             freeform_text = None
+        pasted_raw = data.get("pasted_images")
+        if not isinstance(pasted_raw, list):
+            pasted_raw = []
 
         if data.get("cancelled"):
             raise AskCancelled(str(data.get("reason") or "user cancelled"))
@@ -855,8 +903,8 @@ def _ask_list(
         if bad:
             raise AskCancelled(f"unexpected ids: {bad!r}")
         if not allow_multiple:
-            return chosen[:1], voice_meta, freeform_text
-        return chosen, voice_meta, freeform_text
+            return chosen[:1], voice_meta, freeform_text, pasted_raw
+        return chosen, voice_meta, freeform_text, pasted_raw
 
     if not _GTK4_LIST_ASK.is_file():
         raise RuntimeError(f"missing gtk4 list dialog: {_GTK4_LIST_ASK}")
@@ -933,8 +981,8 @@ def _ask_list(
     if bad:
         raise AskCancelled(f"unexpected ids: {bad!r}")
     if not allow_multiple:
-        return chosen[:1], voice_meta, freeform_text
-    return chosen, voice_meta, freeform_text
+        return chosen[:1], voice_meta, freeform_text, []
+    return chosen, voice_meta, freeform_text, []
 
 
 def _opt_truthy(value: Any) -> bool:
@@ -1138,7 +1186,7 @@ def ask_zenity(
         speak_async(speak_line)
 
     try:
-        chosen_ids, voice_meta, voice_freeform = _ask_list(
+        chosen_ids, voice_meta, voice_freeform, pasted_raw = _ask_list(
             display=display,
             question=question.strip(),
             ids=ids,
@@ -1223,6 +1271,21 @@ def ask_zenity(
             except (OSError, json.JSONDecodeError):
                 meta = {}
         lean = _lean_mcq_result(payload, voice_meta=meta, caps=caps)
+        try:
+            from ask_question_mcp.mcq_pasted import (
+                lean_pasted_fields,
+                normalize_pasted_images,
+            )
+
+            accepted, paste_notes = normalize_pasted_images(pasted_raw)
+            lean.update(lean_pasted_fields(accepted, paste_notes))
+            if accepted:
+                # Internal: server pops before JSON and returns MCP Image blocks.
+                lean["_pasted_image_blobs"] = [
+                    {"format": a["format"], "data": a["data"]} for a in accepted
+                ]
+        except Exception:
+            pass
         # One-shot nudge when host is not on the README verified matrix.
         try:
             from ask_question_mcp.platform_info import (

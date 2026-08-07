@@ -10,11 +10,12 @@ Canonical install steps: this file (and a one-line pointer from the
 
 | Priority | Backend | Notes |
 | --- | --- | --- |
-| 1 (default) | **WebView2 + pywebview** | Nebula-styled floating dialog (`win_webview_ask.py`) |
-| 2 | tkinter | Fallback (`win_list_ask.py`) if pywebview missing |
+| 1 (default) | **WebView2 + pywebview** | Frameless Nebula (`win_webview_ask.py`) |
+| 2 | Edge `--app` | Same Nebula assets; fallback if WebView blanks (`win_edge_ask.py`) |
+| 3 | tkinter | Only if forced (`ASK_QUESTION_WIN_UI=tk`) |
 
-Force with env: `ASK_QUESTION_WIN_UI=webview` or `ASK_QUESTION_WIN_UI=tk`.
-Blank WebView/Edge retries the same backend once; set `ASK_QUESTION_WIN_FALLBACK=tk`
+Force with env: `ASK_QUESTION_WIN_UI=webview`, `edge`, or `tk`.
+Blank WebView/Edge retries once; set `ASK_QUESTION_WIN_FALLBACK=tk`
 only if you want the plain feather/tk window after a second blank.
 
 ## Checklist for Anthony
@@ -56,10 +57,12 @@ Manual mcp.json edit is still fine if you skip the installer — use absolute
 | Lead / detail (ask visible; tall referent scrolls) | Yes (`split_lead_detail` on tk; WebView body scrolls) |
 | Red OK on danger | Yes |
 | Voice / duck / STT | No (text-only) |
-| Image / images preview | No (ignored; text-only for now) |
+| Image / images preview (agent `image=`) | No (ignored for now) |
+| Human Ctrl+V paste references | Yes (Nebula) — thumbnails in-dialog; returned as MCP image blocks |
+| Idle timeout hold while typing/paste | Yes — first freeform keystroke or paste cancels auto-close until OK/Cancel |
 | 1–8 hotkeys + Enter / Esc | Yes |
 | Remember size/position | Yes (`prefs.window`) |
-| Aesthetic | Nebula glass WebView2 (frameless); optional Edge `--app`; tk only if `ASK_QUESTION_WIN_UI=tk` or `ASK_QUESTION_WIN_FALLBACK=tk` (no silent feather fallback) |
+| Aesthetic | Nebula glass WebView2 (frameless); optional Edge `--app`; tk only if forced |
 
 ## Out of scope
 

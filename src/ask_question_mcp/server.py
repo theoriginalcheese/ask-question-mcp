@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
 from ask_question_mcp.doctor import doctor_report, hint_for_error
 from ask_question_mcp.doctor import setup_guide as build_setup_guide
@@ -48,6 +49,24 @@ def record_platform_feedback(choice_id: str) -> str:
     )
 
 
+def _mcq_tool_result(result: dict[str, Any]) -> str | list[Any]:
+    """Lean JSON string, plus MCP Image blocks when the human pasted stills."""
+    blobs = result.pop("_pasted_image_blobs", None) or []
+    text = json.dumps(result, ensure_ascii=False)
+    images: list[Image] = []
+    for blob in blobs:
+        if not isinstance(blob, dict):
+            continue
+        data = blob.get("data")
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            continue
+        fmt = str(blob.get("format") or "png").strip().lower() or "png"
+        images.append(Image(data=bytes(data), format=fmt))
+    if not images:
+        return text
+    return [text, *images]
+
+
 @mcp.tool()
 def ask_multiple_choice(
     question: str,
@@ -64,8 +83,8 @@ def ask_multiple_choice(
     timeout_sec: int = 300,
     image: str | None = None,
     images: list[str] | None = None,
-) -> str:
-    """Desktop MCQ for every decision fork — never markdown A/B/C when available. agent=LANE.id; recommended in label + recommended_id; Something else always; optional image/images (local path or file://) for Gtk preview; dangerous arms OK ~1s. On cancel/errors → check_setup once."""
+) -> str | list[Any]:
+    """Desktop MCQ for every decision fork — never markdown A/B/C when available. agent=LANE.id; recommended in label + recommended_id; Something else always; optional image/images (local path or file://) for Gtk preview; human Ctrl+V paste returns image blocks; dangerous arms OK ~1s. On cancel/errors → check_setup once."""
     try:
         result = ask_zenity(
             question,
@@ -83,7 +102,7 @@ def ask_multiple_choice(
             image=image,
             images=images,
         )
-        return json.dumps(result, ensure_ascii=False)
+        return _mcq_tool_result(result)
     except AskCancelled as exc:
         payload: dict = {
             "cancelled": True,

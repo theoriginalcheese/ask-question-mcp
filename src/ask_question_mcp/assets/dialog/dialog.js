@@ -1,10 +1,18 @@
 (() => {
   const OTHER_IDS = new Set(["other", "something_else", "something-else"]);
+  const MAX_PASTED = 4;
+  // Keep clipboard stills small — huge data-URLs blank/freeze WebView2 under Cursor.
+  const PASTE_MAX_EDGE = 1280;
+  const PASTE_JPEG_QUALITY = 0.82;
+  const PASTE_MAX_B64_CHARS = 1_800_000; // ~1.3 MiB decoded
   const state = {
     payload: null,
     selected: new Set(),
     armed: false,
     typing: false,
+    pasted: [],
+    timeoutId: null,
+    engaged: false,
   };
 
   const $ = (sel) => document.querySelector(sel);
@@ -25,7 +33,7 @@
     // Edge --app / localhost bridge (no pywebview — killable, no destroy hang).
     const bridge = window.__ASK_BRIDGE__;
     if (bridge && typeof bridge === "string") {
-      if (name === "content_ready" || name === "resize_to") {
+      if (name === "content_ready" || name === "resize_to" || name === "hold_timeout") {
         try {
           await fetch(`${bridge}/event`, {
             method: "POST",
@@ -192,11 +200,161 @@
     return ($("#freeform-input")?.value || "").trim();
   }
 
+  function markEngaged() {
+    if (state.engaged) return;
+    state.engaged = true;
+    if (state.timeoutId != null) {
+      clearTimeout(state.timeoutId);
+      state.timeoutId = null;
+    }
+    apiCall("hold_timeout").catch(() => {});
+  }
+
+  function dataUrlToPayload(dataUrl) {
+    const m = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i.exec(dataUrl || "");
+    if (!m) return null;
+    let mime = m[1].toLowerCase();
+    if (mime === "image/jpg") mime = "image/jpeg";
+    if (!["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mime)) {
+      return null;
+    }
+    const data = m[2];
+    if (data.length > PASTE_MAX_B64_CHARS) return null;
+    return { mime, data };
+  }
+
+  function loadImageFromUrl(url) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("image decode failed"));
+      img.src = url;
+    });
+  }
+
+  async function compactFileToDataUrl(file) {
+    // Decode via blob URL (not a giant data: string) then JPEG-downscale.
+    const blobUrl = URL.createObjectURL(file);
+    try {
+      const img = await loadImageFromUrl(blobUrl);
+      let w = img.naturalWidth || img.width || 0;
+      let h = img.naturalHeight || img.height || 0;
+      if (w < 1 || h < 1) return null;
+      const scale = Math.min(1, PASTE_MAX_EDGE / Math.max(w, h));
+      w = Math.max(1, Math.round(w * scale));
+      h = Math.max(1, Math.round(h * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return null;
+      ctx.drawImage(img, 0, 0, w, h);
+      let out = canvas.toDataURL("image/jpeg", PASTE_JPEG_QUALITY);
+      let q = PASTE_JPEG_QUALITY;
+      while (out.length > PASTE_MAX_B64_CHARS && q > 0.45) {
+        q -= 0.12;
+        out = canvas.toDataURL("image/jpeg", q);
+      }
+      if (out.length > PASTE_MAX_B64_CHARS) return null;
+      return out;
+    } catch (_) {
+      return null;
+    } finally {
+      try {
+        URL.revokeObjectURL(blobUrl);
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+
+  function renderRefs() {
+    const box = $("#refs");
+    const strip = $("#refs-strip");
+    if (!box || !strip) return;
+    strip.innerHTML = "";
+    if (!state.pasted.length) {
+      box.hidden = true;
+      requestAnimationFrame(() => fitWindow());
+      return;
+    }
+    box.hidden = false;
+    state.pasted.forEach((item, i) => {
+      const tile = document.createElement("div");
+      tile.className = "ref-tile";
+      tile.setAttribute("role", "listitem");
+      const img = document.createElement("img");
+      img.src = item.dataUrl;
+      img.alt = `Reference ${i + 1}`;
+      const rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "ref-remove";
+      rm.setAttribute("aria-label", `Remove reference ${i + 1}`);
+      rm.textContent = "×";
+      rm.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        state.pasted.splice(i, 1);
+        renderRefs();
+      });
+      tile.appendChild(img);
+      tile.appendChild(rm);
+      strip.appendChild(tile);
+    });
+    // Options area flex-shrinks; footer stays. Still ask host to grow when possible (Edge).
+    requestAnimationFrame(() => fitWindow());
+  }
+
+  function addPastedDataUrl(dataUrl) {
+    if (state.pasted.length >= MAX_PASTED) return false;
+    const payload = dataUrlToPayload(dataUrl);
+    if (!payload) return false;
+    state.pasted.push({ ...payload, dataUrl });
+    markEngaged();
+    renderRefs();
+    return true;
+  }
+
+  async function onPaste(e) {
+    const cd = e.clipboardData;
+    if (!cd) return;
+    const files = [];
+    if (cd.files && cd.files.length) {
+      for (const f of cd.files) {
+        if (f && String(f.type || "").startsWith("image/")) files.push(f);
+      }
+    }
+    if (!files.length && cd.items) {
+      for (const item of cd.items) {
+        if (item.kind === "file" && String(item.type || "").startsWith("image/")) {
+          const f = item.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+    }
+    if (!files.length) return;
+    e.preventDefault();
+    for (const file of files) {
+      if (state.pasted.length >= MAX_PASTED) break;
+      try {
+        const compact = await compactFileToDataUrl(file);
+        if (!compact) continue;
+        addPastedDataUrl(compact);
+      } catch (_) {
+        /* skip unreadable clipboard items */
+      }
+    }
+  }
+
   async function leaveGently() {
     const app = $("#app");
     if (!app || app.classList.contains("is-leaving")) return;
     app.classList.add("is-leaving");
     await new Promise((r) => setTimeout(r, 280));
+  }
+
+  function pastedPayload() {
+    return state.pasted.map(({ mime, data }) => ({ mime, data }));
   }
 
   async function submit() {
@@ -211,7 +369,7 @@
     if (!ids.length) return;
     await leaveGently();
     try {
-      await apiCall("submit", ids, typed || null);
+      await apiCall("submit", ids, typed || null, pastedPayload());
     } catch (err) {
       console.error(err);
     }
@@ -269,6 +427,17 @@
     }
   }
 
+  function updateHint() {
+    const n = Math.min(8, (state.payload.ids || []).length);
+    const hint = $("#hint");
+    if (!hint) return;
+    const base =
+      n <= 1
+        ? "Enter OK · Esc cancel"
+        : `1–${n} select · Enter OK · Esc cancel · Shift+Enter newline`;
+    hint.textContent = `${base} · Ctrl+V image`;
+  }
+
   function mount(payload) {
     state.payload = payload;
     spawnDots();
@@ -303,6 +472,7 @@
     $("#freeform").hidden = !showOther;
     if (showOther) {
       $("#freeform-input").addEventListener("input", () => {
+        markEngaged();
         const typed = freeformText();
         if (!typed) return;
         const other = (payload.ids || []).find((id) => OTHER_IDS.has(id));
@@ -314,17 +484,12 @@
     }
 
     renderOptions();
-
-    const n = Math.min(8, (payload.ids || []).length);
-    const hint = $("#hint");
-    if (hint) {
-      hint.textContent =
-        n <= 1
-          ? "Enter OK · Esc cancel"
-          : `1–${n} select · Enter OK · Esc cancel · Shift+Enter newline`;
-    }
+    updateHint();
 
     document.addEventListener("keydown", onKey);
+    document.addEventListener("paste", (e) => {
+      onPaste(e).catch(() => {});
+    });
     $("#cancel-btn").addEventListener("click", () => cancel());
     $("#close-btn").addEventListener("click", () => cancel());
     $("#ok-btn").addEventListener("click", () => submit());
@@ -346,7 +511,10 @@
     requestAnimationFrame(() => fitWindow());
 
     if (payload.timeout_sec > 0) {
-      setTimeout(() => cancel("timeout"), payload.timeout_sec * 1000);
+      state.timeoutId = setTimeout(
+        () => cancel("timeout"),
+        payload.timeout_sec * 1000,
+      );
     }
   }
 
@@ -355,10 +523,11 @@
     const banner = document.getElementById("banner");
     const question = document.getElementById("question");
     const options = document.getElementById("options");
+    const refs = document.getElementById("refs");
     const freeform = document.getElementById("freeform");
     const footer = document.querySelector(".footer");
     let h = 28;
-    [chrome, question, freeform, footer].forEach((el) => {
+    [chrome, question, refs, freeform, footer].forEach((el) => {
       if (el && !el.hidden) h += el.offsetHeight;
     });
     if (banner && banner.classList.contains("is-on")) {

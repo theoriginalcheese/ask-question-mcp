@@ -118,6 +118,10 @@ class _Bridge:
         self._closed = False
         self._content_ready = threading.Event()
         self._close_requested = threading.Event()
+        self._watchdog: threading.Timer | None = None
+        self._engaged = False
+        self._want_size: tuple[int, int] | None = None
+        self._size_lock = threading.Lock()
 
     def get_payload(self) -> dict[str, Any]:
         _dbg("api get_payload")
@@ -132,17 +136,44 @@ class _Bridge:
         """JS → Python debug breadcrumb."""
         _dbg(f"js: {message}")
 
-    def submit(self, ids: list[Any] | None = None, freeform_text: str | None = None) -> None:
+    def hold_timeout(self) -> None:
+        """Human started typing / pasted — cancel idle auto-close."""
+        if self._engaged:
+            return
+        self._engaged = True
+        _dbg("api hold_timeout")
+        if self._watchdog is not None:
+            try:
+                self._watchdog.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+            self._watchdog = None
+        if self._result_path:
+            try:
+                Path(str(self._result_path) + ".engaged").write_text(
+                    "1", encoding="utf-8"
+                )
+            except OSError:
+                pass
+
+    def submit(
+        self,
+        ids: list[Any] | None = None,
+        freeform_text: str | None = None,
+        pasted_images: list[Any] | None = None,
+    ) -> None:
         chosen = [str(x) for x in (ids or []) if str(x).strip()]
         out: dict[str, Any] = {"ids": chosen}
         typed = (freeform_text or "").strip()
         if typed:
             out["freeform_text"] = typed
+        if isinstance(pasted_images, list) and pasted_images:
+            out["pasted_images"] = pasted_images
         if not chosen:
             self._result = {"cancelled": True, "reason": "empty selection"}
         else:
             self._result = out
-        _dbg("api submit", out=out)
+        _dbg("api submit", out={k: v for k, v in out.items() if k != "pasted_images"})
         self._request_close()
 
     def cancel(self, reason: str = "user cancelled") -> None:
@@ -151,9 +182,12 @@ class _Bridge:
         self._request_close()
 
     def resize_to(self, width: int = 0, height: int = 0) -> None:
-        """No-op — resizing from the JS bridge deadlocks WebView2 under Cursor."""
-        _dbg("api resize_to ignored", width=width, height=height)
-        return
+        """Queue a size change — applied on the lifecycle thread (JS-thread resize deadlocks)."""
+        w = max(400, min(900, int(width or 0)))
+        h = max(360, min(980, int(height or 0)))
+        with self._size_lock:
+            self._want_size = (w, h)
+        _dbg("api resize_to queued", width=w, height=h)
 
     def _request_close(self) -> None:
         if self._closed:
@@ -181,12 +215,96 @@ class _Bridge:
         threading.Thread(target=_bail, daemon=True, name="bail").start()
 
 
+def _apply_window_size(hwnd: int, width: int, height: int) -> None:
+    """Resize via Win32 from a non-JS thread (safe under Cursor)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return
+        x, y = int(rect.left), int(rect.top)
+        SWP_NOZORDER = 0x0004
+        SWP_NOACTIVATE = 0x0010
+        user32.SetWindowPos(
+            hwnd,
+            0,
+            x,
+            y,
+            int(width),
+            int(height),
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+        _dbg("apply_window_size", hwnd=hwnd, width=width, height=height)
+    except Exception as exc:  # noqa: BLE001
+        _dbg("apply_window_size failed", error=str(exc))
+
+
+def _ease_out_cubic(t: float) -> float:
+    u = 1.0 - t
+    return 1.0 - u * u * u
+
+
+def _animate_window_size(
+    hwnd: int,
+    width: int,
+    height: int,
+    *,
+    duration_ms: int = 340,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """Ease the HWND to a new size — avoids the hard snap when References appear."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return
+        x0, y0 = int(rect.left), int(rect.top)
+        w0 = max(1, int(rect.right - rect.left))
+        h0 = max(1, int(rect.bottom - rect.top))
+        w1, h1 = int(width), int(height)
+        if abs(w1 - w0) < 2 and abs(h1 - h0) < 2:
+            return
+
+        SWP_NOZORDER = 0x0004
+        SWP_NOACTIVATE = 0x0010
+        steps = max(8, int(duration_ms / 16))
+        t0 = time.perf_counter()
+        for i in range(1, steps + 1):
+            if stop_event is not None and stop_event.is_set():
+                return
+            # Pace by clock so slow machines still finish on time.
+            elapsed = (time.perf_counter() - t0) * 1000.0
+            t = min(1.0, elapsed / max(1.0, float(duration_ms)))
+            e = _ease_out_cubic(t)
+            w = int(round(w0 + (w1 - w0) * e))
+            h = int(round(h0 + (h1 - h0) * e))
+            user32.SetWindowPos(
+                hwnd, 0, x0, y0, w, h, SWP_NOZORDER | SWP_NOACTIVATE
+            )
+            if t >= 1.0:
+                break
+            time.sleep(0.016)
+        # Snap to exact target.
+        user32.SetWindowPos(
+            hwnd, 0, x0, y0, w1, h1, SWP_NOZORDER | SWP_NOACTIVATE
+        )
+        _dbg("animate_window_size done", hwnd=hwnd, width=w1, height=h1)
+    except Exception as exc:  # noqa: BLE001
+        _dbg("animate_window_size failed", error=str(exc))
+        _apply_window_size(hwnd, width, height)
+
+
 def _soft_foreground(window: Any) -> None:
     """Bring to front without AttachThreadInput / pywebview on_top (those freeze)."""
     _dbg("soft_foreground begin")
     try:
         import ctypes
-        from ctypes import wintypes
 
         hwnd = int(window.native.Handle.ToInt64())
         global _HWND
@@ -203,7 +321,7 @@ def _soft_foreground(window: Any) -> None:
         VK_MENU = 0x12  # Alt
 
         user32.ShowWindow(hwnd, SW_RESTORE)
-        # Brief TOPMOST via Win32 (not window.on_top) — then drop it.
+        # Brief TOPMOST via Win32 (not window.on_top) — then drop it immediately.
         user32.SetWindowPos(
             hwnd,
             HWND_TOPMOST,
@@ -261,7 +379,21 @@ def _lifecycle(bridge: _Bridge, window: Any, result_path: str | None) -> None:
             os._exit(1)
 
     _dbg("lifecycle waiting for close")
-    bridge._close_requested.wait(timeout=3600)
+    while not bridge._close_requested.wait(timeout=0.2):
+        if bridge._closed:
+            break
+        want: tuple[int, int] | None = None
+        with bridge._size_lock:
+            if bridge._want_size is not None:
+                want = bridge._want_size
+                bridge._want_size = None
+        if want and _HWND:
+            _animate_window_size(
+                _HWND,
+                want[0],
+                want[1],
+                stop_event=bridge._close_requested,
+            )
     _dbg("lifecycle close seen — destroy attempt")
     time.sleep(0.2)
 
@@ -285,7 +417,7 @@ def _arm_watchdog(bridge: _Bridge, timeout_sec: int, result_path: str | None) ->
         return
 
     def _fire() -> None:
-        if bridge._closed or _emitted:
+        if bridge._closed or _emitted or bridge._engaged:
             return
         bridge._result = {"cancelled": True, "reason": "timeout"}
         _emit(bridge._result, result_path)
@@ -293,7 +425,9 @@ def _arm_watchdog(bridge: _Bridge, timeout_sec: int, result_path: str | None) ->
         time.sleep(0.3)
         os._exit(1)
 
-    threading.Timer(float(timeout_sec), _fire).start()
+    timer = threading.Timer(float(timeout_sec), _fire)
+    bridge._watchdog = timer
+    timer.start()
 
 
 def main() -> int:

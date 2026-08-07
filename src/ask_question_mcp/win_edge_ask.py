@@ -42,9 +42,11 @@ _STATE: dict[str, Any] = {
     "result": None,
     "done": threading.Event(),
     "ready": threading.Event(),
+    "engaged": threading.Event(),
     "edge_pid": None,
     "hits": [],
 }
+_ENGAGED_ABS_SEC = 4 * 60 * 60
 
 
 def _log(msg: str) -> None:
@@ -119,7 +121,7 @@ def _kill_tree(pid: int | None) -> None:
 
 
 def _raise_edge() -> None:
-    """Best-effort bring Edge --app above Cursor — no TOPMOST (taskbar flash)."""
+    """Best-effort bring Edge --app above Cursor — no lasting TOPMOST."""
     try:
         import ctypes
         from ctypes import wintypes
@@ -384,6 +386,15 @@ def _capture_hwnd_png(hwnd: int, path: str) -> None:
         _log(f"screenshot failed: {exc}")
 
 
+def _touch_engaged(result_path: str | None) -> None:
+    if not result_path:
+        return
+    try:
+        Path(str(result_path) + ".engaged").write_text("1", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _finish(result: dict[str, Any], result_path: str | None) -> None:
     if _STATE["done"].is_set():
         return
@@ -488,6 +499,9 @@ class _Handler(BaseHTTPRequestHandler):
                 _STATE["ready"].set()
                 threading.Thread(target=_raise_edge, daemon=True).start()
                 threading.Timer(0.35, _raise_edge).start()
+            elif name == "hold_timeout":
+                _STATE["engaged"].set()
+                _touch_engaged(self.result_path)
             self.send_response(200)
             self._cors()
             self.send_header("Content-Type", "application/json")
@@ -519,11 +533,14 @@ class _Handler(BaseHTTPRequestHandler):
         if name == "submit":
             ids = args[0] if args else []
             freeform = args[1] if len(args) > 1 else None
+            pasted = args[2] if len(args) > 2 else None
             chosen = [str(x) for x in (ids or []) if str(x).strip()]
             out: dict[str, Any] = {"ids": chosen}
             typed = (str(freeform) if freeform is not None else "").strip()
             if typed:
                 out["freeform_text"] = typed
+            if isinstance(pasted, list) and pasted:
+                out["pasted_images"] = pasted
             if not chosen:
                 out = {"cancelled": True, "reason": "empty selection"}
             # Respond BEFORE killing Edge — otherwise Enter feels stuck.
@@ -720,10 +737,42 @@ def main() -> int:
 
     threading.Timer(12.0, _blank).start()
 
-    wait = timeout_sec if timeout_sec > 0 else 300
-    finished = _STATE["done"].wait(timeout=float(wait))
-    if not finished:
-        _finish({"cancelled": True, "reason": "timeout"}, result_path)
+    # Soft idle timeout; typing/paste sets engaged and waits until submit.
+    # timeout_sec <= 0 → no soft idle (AGENTS); still keep an absolute ceiling.
+    absolute = time.monotonic() + float(_ENGAGED_ABS_SEC)
+    if timeout_sec <= 0:
+        while not _STATE["done"].is_set():
+            if _STATE["done"].wait(timeout=1.0):
+                break
+            if time.monotonic() >= absolute:
+                _finish(
+                    {"cancelled": True, "reason": "engaged absolute timeout"},
+                    result_path,
+                )
+                break
+    else:
+        deadline = time.monotonic() + float(timeout_sec)
+        while not _STATE["done"].is_set():
+            remaining = max(0.05, min(1.0, deadline - time.monotonic()))
+            if _STATE["done"].wait(timeout=remaining):
+                break
+            if _STATE["engaged"].is_set():
+                deadline = absolute
+                if time.monotonic() >= absolute:
+                    _finish(
+                        {
+                            "cancelled": True,
+                            "reason": "engaged absolute timeout",
+                        },
+                        result_path,
+                    )
+                    break
+                continue
+            if time.monotonic() >= deadline:
+                _finish(
+                    {"cancelled": True, "reason": "timeout"}, result_path
+                )
+                break
 
     time.sleep(0.3)
     _kill_tree(proc.pid)

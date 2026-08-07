@@ -76,7 +76,7 @@ skill via `ask-question-install --skill` (`~/.cursor/skills/ask-multiple-choice`
 | `speak` | bool | no | default `true` (honours mute env / missing TTS) |
 | `title` | string | no | default `"Decide"` — short noun phrase |
 | `agent` | string \| null | **strongly yes** | Window title prefix `[agent]` |
-| `timeout_sec` | int | no | default `300`; `0` = no timeout |
+| `timeout_sec` | int | no | default `300`; `0` = no timeout. After the human types or pastes an image, idle auto-close is held until submit/cancel. |
 | `entry_seed` | string \| null | no | Prefill Something else / entry |
 | `image` | string \| null | no | Local PNG/JPEG (etc.) path or `file://` URI — Gtk preview above the question (Linux). Missing/unsupported files are skipped. |
 | `images` | string[] \| null | no | Same as `image`, up to 4 paths (combined with `image`, deduped). Prefer one clear still when possible. |
@@ -178,6 +178,8 @@ footer hint. Useful when coaching a human or writing host docs.
 | **R** / **L** | Replay question / Listen (Linux voice only, when configured). |
 | **Click preview** (image MCQs) | Toggle large vs compact (~320px) image scale. |
 | **F** / header maximize (image MCQs) | Maximize / restore the window so the still can use most of the screen. |
+| **Ctrl+V** (Windows Nebula) | Paste clipboard images as in-dialog **References** (max 4). No lasting local files — pixels return as MCP image blocks. |
+| **Typing / paste** | First freeform keystroke or image paste **cancels idle `timeout_sec` auto-close** until OK / Cancel / Esc. |
 
 ### Reading the question (lead + detail)
 
@@ -222,6 +224,11 @@ Parse the string before branching.
 **Multi select:** `ids` + `labels` instead of `id` / `label`.
 
 **Freeform:** same shape plus `"freeform": true` and `"freeform_text": "…"`.
+
+**Pasted references (Windows Nebula):** lean JSON may include
+`pasted_image_count` (and optional `pasted_image_notes`). The tool result then
+also carries MCP **image** content blocks so the model can see the stills —
+do not expect base64 inside the JSON string.
 
 **Cancelled:**
 
