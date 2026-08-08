@@ -502,6 +502,9 @@ class _Handler(BaseHTTPRequestHandler):
             elif name == "hold_timeout":
                 _STATE["engaged"].set()
                 _touch_engaged(self.result_path)
+            elif name == "closing":
+                # JS hide-first hint — Edge process is killed on submit/cancel.
+                pass
             self.send_response(200)
             self._cors()
             self.send_header("Content-Type", "application/json")
@@ -646,8 +649,22 @@ def main() -> int:
         if _prefs is not None
         else {"w": 560, "h": 640}
     )
+    # Clamp to a sane range — Edge --app uses physical-ish window-size and
+    # does not get our Win32 DPI rescale path.
     width = max(480, min(720, int(geom.get("w") or 560)))
-    height = max(560, min(920, int(geom.get("h") or 640)))
+    height = max(480, min(800, int(geom.get("h") or 640)))
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        rect = wintypes.RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+            ww = max(320, int(rect.right - rect.left))
+            wh = max(320, int(rect.bottom - rect.top))
+            width = min(width, max(480, int(ww * 0.90)))
+            height = min(height, max(480, int(wh * 0.90)))
+    except Exception:  # noqa: BLE001
+        pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     port = server.server_address[1]

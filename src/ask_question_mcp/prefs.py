@@ -40,7 +40,7 @@ _DEFAULTS: dict[str, Any] = {
     "speak_volume": 0.60,
     "ack_volume": 0.55,
     # Last dialog size/position (x/y may be ignored on Wayland).
-    "window": {"w": 520, "h": 480},
+    "window": {"w": 600, "h": 720},
 }
 
 
@@ -190,9 +190,13 @@ def get_window_geometry() -> dict[str, int]:
             continue
         out[key] = val
     if "w" not in out:
-        out["w"] = 520
+        out["w"] = 600
     if "h" not in out:
-        out["h"] = 480
+        out["h"] = 720
+    # Hard caps so a one-off tall/wide dialog on a 4K panel cannot poison a
+    # later open on a laptop / lower-res monitor.
+    out["w"] = max(200, min(int(out["w"]), 900))
+    out["h"] = max(200, min(int(out["h"]), 920))
     return out
 
 
@@ -206,9 +210,11 @@ def set_window_geometry(
     """Persist dialog geometry (merge with previous)."""
     cur = get_window_geometry()
     if w is not None and w >= 200:
-        cur["w"] = int(w)
+        cur["w"] = max(200, min(int(w), 900))
     if h is not None and h >= 200:
-        cur["h"] = int(h)
+        # Cap persisted height — tall image/MCQ sessions must not leave a
+        # permanent empty band under Cancel/OK on the next text-only open.
+        cur["h"] = max(200, min(int(h), 720))
     if x is not None:
         cur["x"] = int(x)
     if y is not None:

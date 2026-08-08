@@ -796,10 +796,12 @@ def _ask_list(
         except AskCancelled:
             raise
 
-        # Edge/WebView blank → retry same Nebula/Edge backend once (brief pause
-        # so a hard os._exit teardown can finish). Do **not** auto-swap to
-        # tkinter — that shows the plain "feather" Windows dialog and looks
-        # like a different product. Opt in with ASK_QUESTION_WIN_FALLBACK=tk.
+        # Edge/WebView blank / bridge race → retry same Nebula/Edge backend once
+        # (brief pause so a hard os._exit teardown can finish). Also treat
+        # "pywebview unavailable" / webview failed as retryable — the JS bridge
+        # can race empty api:{} before finish.js binds methods. Do **not**
+        # auto-swap to tkinter — that shows the plain "feather" Windows dialog
+        # and looks like a different product. Opt in with ASK_QUESTION_WIN_FALLBACK=tk.
         blank = False
         if list_script in {_WIN_WEBVIEW_ASK, _WIN_EDGE_ASK}:
             if not (raw or "").strip():
@@ -809,18 +811,30 @@ def _ask_list(
                     probe = json.loads(raw)
                     reason = str(probe.get("reason") or "").casefold()
                     if probe.get("cancelled") and (
-                        "blank" in reason or "failed to load" in reason
+                        "blank" in reason
+                        or "failed to load" in reason
                         or "edge not found" in reason
+                        or "pywebview unavailable" in reason
+                        or "webview failed" in reason
+                        or "bridge unavailable" in reason
                     ):
                         blank = True
                 except json.JSONDecodeError:
                     blank = True
         if blank:
             time.sleep(0.6)
+            # Prefer Edge on second try if WebView2 profile/bridge flaked.
+            retry_script = list_script
+            if (
+                list_script == _WIN_WEBVIEW_ASK
+                and _WIN_EDGE_ASK.is_file()
+                and _find_edge_browser()
+            ):
+                retry_script = _WIN_EDGE_ASK
             try:
                 raw, rc, err = _run_win_dialog(
                     win_py,
-                    list_script,
+                    retry_script,
                     payload,
                     timeout_sec=timeout_sec,
                     grace_sec=15,
@@ -839,6 +853,9 @@ def _ask_list(
                         "blank" in reason2
                         or "failed to load" in reason2
                         or "edge not found" in reason2
+                        or "pywebview unavailable" in reason2
+                        or "webview failed" in reason2
+                        or "bridge unavailable" in reason2
                     ):
                         still_blank = True
                 except json.JSONDecodeError:
@@ -850,7 +867,7 @@ def _ask_list(
                 still_blank
                 and allow_tk
                 and _WIN_LIST_ASK.is_file()
-                and list_script != _WIN_LIST_ASK
+                and retry_script != _WIN_LIST_ASK
             ):
                 try:
                     raw, rc, err = _run_win_dialog(

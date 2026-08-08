@@ -258,6 +258,7 @@ def main() -> int:
     freeform_var = tk.StringVar()
     other_ids = {"other", "something_else", "something-else"}
     freeform_entry: Any = None
+    timeout_after: dict[str, Any] = {"id": None}
     if allow_other and any(oid in other_ids for oid in ids):
         ff = ttk.Frame(outer)
         ff.grid(row=3, column=0, sticky="ew", pady=(8, 0))
@@ -267,6 +268,14 @@ def main() -> int:
         freeform_entry.grid(row=1, column=0, sticky="ew", pady=(4, 0))
 
         def on_ff_key(_event: object = None) -> None:
+            # First freeform keystroke cancels idle auto-close.
+            tid = timeout_after.get("id")
+            if tid is not None:
+                try:
+                    root.after_cancel(tid)
+                except tk.TclError:
+                    pass
+                timeout_after["id"] = None
             text = freeform_var.get().strip()
             if not text:
                 return
@@ -461,9 +470,10 @@ def main() -> int:
     if timeout_sec > 0:
 
         def on_timeout() -> None:
+            timeout_after["id"] = None
             finish({"cancelled": True, "reason": "timeout"})
 
-        root.after(timeout_sec * 1000, on_timeout)
+        timeout_after["id"] = root.after(timeout_sec * 1000, on_timeout)
 
     # Restore size/position when known; else centre roughly.
     root.update_idletasks()

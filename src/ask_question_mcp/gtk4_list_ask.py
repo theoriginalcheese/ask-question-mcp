@@ -774,6 +774,8 @@ def _main() -> int:
         listen_gen = {"n": 0}
         voice_retries = {"n": 0}
         closed = {"v": False}
+        # Idle auto-close source; cleared on first freeform keystroke / paste.
+        timeout_src: dict[str, int | None] = {"id": None}
         # Unmatched speech → confirm as freeform (Something else / Use this).
         freeform_pending = {"text": ""}
         # Surfaced to MCP/chat so the agent sees what STT heard.
@@ -1401,6 +1403,8 @@ def _main() -> int:
                     _selecting_from_entry["v"] = False
 
             def on_freeform_changed(_entry: Gtk.Entry) -> None:
+                # First keystroke cancels idle auto-close — no rush while typing.
+                hold_idle_timeout()
                 if (freeform_entry.get_text() or "").strip():
                     _select_other(from_entry=True)
 
@@ -1652,6 +1656,17 @@ def _main() -> int:
                 except Exception:  # noqa: BLE001
                     pass
             application.quit()
+
+        def hold_idle_timeout() -> None:
+            """Cancel idle auto-close after the human starts typing / pasting."""
+            sid = timeout_src["id"]
+            if sid is None:
+                return
+            try:
+                GLib.source_remove(sid)
+            except Exception:  # noqa: BLE001
+                pass
+            timeout_src["id"] = None
 
         def finish_cancel(reason: str = "user cancelled") -> None:
             nonlocal result
@@ -2311,10 +2326,11 @@ def _main() -> int:
         if timeout_sec > 0:
 
             def on_timeout() -> bool:
+                timeout_src["id"] = None
                 finish_cancel("timed out")
                 return GLib.SOURCE_REMOVE
 
-            GLib.timeout_add_seconds(timeout_sec, on_timeout)
+            timeout_src["id"] = GLib.timeout_add_seconds(timeout_sec, on_timeout)
 
         win.present()
         # Focus an option row — never OK — so Space toggles/selects, Return confirms.

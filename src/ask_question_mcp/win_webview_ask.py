@@ -21,11 +21,18 @@ import time
 from pathlib import Path
 from typing import Any
 
-_WV2_DIR = (
-    Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
-    / "ask-question-mcp"
-    / "webview2-profile"
-)
+# Prefer parent-provided per-spawn folder (zenity_ask._win_webview2_env) so
+# overlapping MCQs never fight one shared Edge profile lock. Fall back to a
+# stable local profile only when launched standalone.
+_existing_wv2 = (os.environ.get("WEBVIEW2_USER_DATA_FOLDER") or "").strip()
+if _existing_wv2:
+    _WV2_DIR = Path(_existing_wv2)
+else:
+    _WV2_DIR = (
+        Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+        / "ask-question-mcp"
+        / "webview2-profile"
+    )
 _WV2_DIR.mkdir(parents=True, exist_ok=True)
 os.environ["WEBVIEW2_USER_DATA_FOLDER"] = str(_WV2_DIR)
 
@@ -156,19 +163,44 @@ class _Bridge:
             except OSError:
                 pass
 
+    def closing(self) -> None:
+        """Hide the HWND immediately — JS leaveGently alone leaves a blank
+        void if submit stalls on a huge clipboard still."""
+        global _HWND
+        _dbg("api closing")
+        if _HWND:
+            try:
+                import ctypes
+
+                ctypes.windll.user32.ShowWindow(int(_HWND), 0)  # SW_HIDE
+                _dbg("closing: hwnd hidden", hwnd=_HWND)
+            except Exception as exc:  # noqa: BLE001
+                _dbg("closing: hide failed", error=str(exc))
+
     def submit(
         self,
         ids: list[Any] | None = None,
         freeform_text: str | None = None,
         pasted_images: list[Any] | None = None,
     ) -> None:
+        # Hide first so a slow bridge payload cannot leave a blank card up.
+        self.closing()
         chosen = [str(x) for x in (ids or []) if str(x).strip()]
         out: dict[str, Any] = {"ids": chosen}
         typed = (freeform_text or "").strip()
         if typed:
             out["freeform_text"] = typed
         if isinstance(pasted_images, list) and pasted_images:
-            out["pasted_images"] = pasted_images
+            # Drop megabyte clipboard JPEGs — they hang the Cursor MCP pipe
+            # and are rarely needed when freeform text is present.
+            try:
+                approx = len(json.dumps(pasted_images))
+            except (TypeError, ValueError):
+                approx = 10**9
+            if approx <= 180_000:
+                out["pasted_images"] = pasted_images
+            else:
+                _dbg("submit: dropped oversized pasted_images", chars=approx)
         if not chosen:
             self._result = {"cancelled": True, "reason": "empty selection"}
         else:
@@ -177,6 +209,7 @@ class _Bridge:
         self._request_close()
 
     def cancel(self, reason: str = "user cancelled") -> None:
+        self.closing()
         self._result = {"cancelled": True, "reason": str(reason or "user cancelled")}
         _dbg("api cancel", reason=reason)
         self._request_close()
@@ -215,8 +248,141 @@ class _Bridge:
         threading.Thread(target=_bail, daemon=True, name="bail").start()
 
 
+def _dpi_scale_for_hwnd(hwnd: int) -> float:
+    """CSS/layout px → physical px. JS fitWindow reports CSS; SetWindowPos is physical.
+
+    Without this, 125–200% monitors get a dialog that is too small and clips
+    the footer / options (exactly the laptop-vs-desktop symptom).
+    """
+    try:
+        import ctypes
+
+        get_dpi = getattr(ctypes.windll.user32, "GetDpiForWindow", None)
+        if get_dpi is not None and hwnd:
+            dpi = int(get_dpi(int(hwnd)))
+            if dpi > 0:
+                return max(1.0, dpi / 96.0)
+        get_dc = ctypes.windll.user32.GetDC
+        release = ctypes.windll.user32.ReleaseDC
+        get_caps = ctypes.windll.gdi32.GetDeviceCaps
+        LOGPIXELSX = 88
+        hdc = get_dc(0)
+        try:
+            dpi = int(get_caps(hdc, LOGPIXELSX))
+        finally:
+            release(0, hdc)
+        if dpi > 0:
+            return max(1.0, dpi / 96.0)
+    except Exception:  # noqa: BLE001
+        pass
+    return 1.0
+
+
+def _primary_workarea() -> tuple[int, int, int, int]:
+    """Return (x, y, w, h) of the primary monitor work area in physical px."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        rect = wintypes.RECT()
+        # SPI_GETWORKAREA = 0x0030 — primary work area (excludes taskbar).
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+            x = int(rect.left)
+            y = int(rect.top)
+            w = max(320, int(rect.right - rect.left))
+            h = max(320, int(rect.bottom - rect.top))
+            return x, y, w, h
+    except Exception:  # noqa: BLE001
+        pass
+    return 0, 0, 1280, 720
+
+
+def _workarea_for_hwnd(hwnd: int) -> tuple[int, int, int, int]:
+    """Work area of the monitor hosting ``hwnd`` (physical px)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        MONITOR_DEFAULTTONEAREST = 2
+        mon = user32.MonitorFromWindow(int(hwnd), MONITOR_DEFAULTTONEAREST)
+        if not mon:
+            return _primary_workarea()
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if not user32.GetMonitorInfoW(mon, ctypes.byref(info)):
+            return _primary_workarea()
+        r = info.rcWork
+        return (
+            int(r.left),
+            int(r.top),
+            max(320, int(r.right - r.left)),
+            max(320, int(r.bottom - r.top)),
+        )
+    except Exception:  # noqa: BLE001
+        return _primary_workarea()
+
+
+def _clamp_physical_size(
+    hwnd: int | None,
+    width: int,
+    height: int,
+) -> tuple[int, int]:
+    """Keep the dialog inside the host (or primary) work area with a margin."""
+    if hwnd:
+        _wx, _wy, ww, wh = _workarea_for_hwnd(int(hwnd))
+    else:
+        _wx, _wy, ww, wh = _primary_workarea()
+    margin = 24
+    max_w = max(360, ww - margin)
+    max_h = max(360, wh - margin)
+    return (
+        max(360, min(int(width), max_w)),
+        max(360, min(int(height), max_h)),
+    )
+
+
+def _css_to_physical(hwnd: int, width: int, height: int) -> tuple[int, int]:
+    scale = _dpi_scale_for_hwnd(hwnd)
+    pw = max(1, int(round(int(width) * scale)))
+    ph = max(1, int(round(int(height) * scale)))
+    return _clamp_physical_size(hwnd, pw, ph)
+
+
+def _initial_window_size(geom: dict[str, int], needed: int) -> tuple[int, int]:
+    """CSS/create_window size clamped to primary work area (physical→approx CSS)."""
+    _x, _y, ww, wh = _primary_workarea()
+    # create_window sizes are passed to WinForms before HWND DPI is known;
+    # keep them modest and let JS fitWindow + DPI scale finish the job.
+    remembered = int(geom.get("h") or 0)
+    height = min(remembered, 920) if remembered >= needed else needed
+    width = max(560, min(760, int(geom.get("w") or 600)))
+    # Cap against ~90% of primary work area so a 720p laptop / 125% DPI
+    # machine does not open taller than the screen.
+    max_h = max(420, int(wh * 0.90))
+    max_w = max(480, int(ww * 0.90))
+    height = max(420, min(height, max_h, 920))
+    width = max(480, min(width, max_w, 760))
+    # Prefer content-needed height over a stale oversized prefs value.
+    if remembered > needed + 80:
+        height = min(height, max(needed, min(remembered, max_h)))
+    return width, height
+
+
 def _apply_window_size(hwnd: int, width: int, height: int) -> None:
-    """Resize via Win32 from a non-JS thread (safe under Cursor)."""
+    """Resize via Win32 from a non-JS thread (safe under Cursor).
+
+    ``width``/``height`` are CSS px from the dialog JS (``fitWindow``).
+    """
     try:
         import ctypes
         from ctypes import wintypes
@@ -226,6 +392,7 @@ def _apply_window_size(hwnd: int, width: int, height: int) -> None:
         if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
             return
         x, y = int(rect.left), int(rect.top)
+        pw, ph = _css_to_physical(hwnd, width, height)
         SWP_NOZORDER = 0x0004
         SWP_NOACTIVATE = 0x0010
         user32.SetWindowPos(
@@ -233,11 +400,19 @@ def _apply_window_size(hwnd: int, width: int, height: int) -> None:
             0,
             x,
             y,
-            int(width),
-            int(height),
+            pw,
+            ph,
             SWP_NOZORDER | SWP_NOACTIVATE,
         )
-        _dbg("apply_window_size", hwnd=hwnd, width=width, height=height)
+        _dbg(
+            "apply_window_size",
+            hwnd=hwnd,
+            css_width=width,
+            css_height=height,
+            width=pw,
+            height=ph,
+            dpi_scale=_dpi_scale_for_hwnd(hwnd),
+        )
     except Exception as exc:  # noqa: BLE001
         _dbg("apply_window_size failed", error=str(exc))
 
@@ -255,7 +430,10 @@ def _animate_window_size(
     duration_ms: int = 340,
     stop_event: threading.Event | None = None,
 ) -> None:
-    """Ease the HWND to a new size — avoids the hard snap when References appear."""
+    """Ease the HWND to a new size — avoids the hard snap when References appear.
+
+    ``width``/``height`` are CSS px from the dialog JS.
+    """
     try:
         import ctypes
         from ctypes import wintypes
@@ -267,7 +445,7 @@ def _animate_window_size(
         x0, y0 = int(rect.left), int(rect.top)
         w0 = max(1, int(rect.right - rect.left))
         h0 = max(1, int(rect.bottom - rect.top))
-        w1, h1 = int(width), int(height)
+        w1, h1 = _css_to_physical(hwnd, width, height)
         if abs(w1 - w0) < 2 and abs(h1 - h0) < 2:
             return
 
@@ -382,6 +560,25 @@ def _lifecycle(bridge: _Bridge, window: Any, result_path: str | None) -> None:
     while not bridge._close_requested.wait(timeout=0.2):
         if bridge._closed:
             break
+        # Alt+F4 / taskbar close can destroy the HWND without JS cancel —
+        # treat a dead window as cancel so the MCP tool does not hang.
+        if _HWND and not bridge._closed:
+            try:
+                import ctypes
+
+                if not bool(ctypes.windll.user32.IsWindow(int(_HWND))):
+                    _dbg("lifecycle hwnd gone — cancel")
+                    if not _emitted:
+                        bridge._result = {
+                            "cancelled": True,
+                            "reason": "window closed",
+                        }
+                        _emit(bridge._result, result_path)
+                    bridge._closed = True
+                    bridge._close_requested.set()
+                    break
+            except Exception:  # noqa: BLE001
+                pass
         want: tuple[int, int] | None = None
         with bridge._size_lock:
             if bridge._want_size is not None:
@@ -513,10 +710,8 @@ def main() -> int:
         needed += 150
     if ui_payload["dangerous"]:
         needed += 72
-    needed = max(620, min(needed, 920))
-    remembered = int(geom.get("h") or 0)
-    height = min(remembered, 920) if remembered >= needed else needed
-    width = max(480, min(720, int(geom.get("w") or 560)))
+    needed = max(680, min(needed, 920))
+    width, height = _initial_window_size(geom, needed)
 
     bridge = _Bridge(ui_payload, result_path=result_path)
     index_url = _INDEX.resolve().as_uri()
@@ -540,7 +735,7 @@ def main() -> int:
         js_api=bridge,
         width=width,
         height=height,
-        min_size=(400, max(360, min(needed, 560))),
+        min_size=(480, max(420, min(needed, 600))),
         frameless=True,
         easy_drag=True,
         on_top=False,
@@ -551,6 +746,28 @@ def main() -> int:
         text_select=True,
     )
     bridge._window = window
+
+    def _on_window_closed() -> None:
+        """Alt+F4 / OS close — emit cancel so the parent MCP call unblocks."""
+        _dbg("window.events.closed")
+        if bridge._closed or _emitted:
+            return
+        if bridge._watchdog is not None:
+            try:
+                bridge._watchdog.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+            bridge._watchdog = None
+        bridge._result = {"cancelled": True, "reason": "window closed"}
+        _emit(bridge._result, result_path)
+        bridge._closed = True
+        bridge._close_requested.set()
+
+    try:
+        window.events.closed += _on_window_closed
+    except Exception as exc:  # noqa: BLE001
+        _dbg("window.events.closed subscribe failed", error=str(exc))
+
     _arm_watchdog(bridge, timeout_sec, result_path)
     threading.Thread(
         target=_lifecycle,
@@ -568,7 +785,14 @@ def main() -> int:
         _emit({"cancelled": True, "reason": f"webview failed: {exc}"}, result_path)
         return 1
 
-    _emit(bridge._result, result_path)
+    # start() returned without our close path (e.g. Alt+F4 before events fired).
+    if not bridge._closed and not _emitted:
+        bridge._result = {"cancelled": True, "reason": "window closed"}
+        _emit(bridge._result, result_path)
+        bridge._closed = True
+        bridge._close_requested.set()
+    else:
+        _emit(bridge._result, result_path)
     return 0 if not bridge._result.get("cancelled") else 1
 
 

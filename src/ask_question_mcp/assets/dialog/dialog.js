@@ -29,11 +29,20 @@
     return String(label || "").replace(/^\d+\s*[·.]\s*/, "").trim();
   }
 
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
   async function apiCall(name, ...args) {
     // Edge --app / localhost bridge (no pywebview — killable, no destroy hang).
     const bridge = window.__ASK_BRIDGE__;
     if (bridge && typeof bridge === "string") {
-      if (name === "content_ready" || name === "resize_to" || name === "hold_timeout") {
+      if (
+        name === "content_ready" ||
+        name === "resize_to" ||
+        name === "hold_timeout" ||
+        name === "closing"
+      ) {
         try {
           await fetch(`${bridge}/event`, {
             method: "POST",
@@ -57,11 +66,15 @@
       return data.result;
     }
 
-    const api = window.pywebview && window.pywebview.api;
-    if (!api || typeof api[name] !== "function") {
-      throw new Error(`pywebview api.${name} unavailable`);
+    // pywebview injects api:{} before finish.js binds methods — retry briefly.
+    for (let i = 0; i < 80; i += 1) {
+      const api = window.pywebview && window.pywebview.api;
+      if (api && typeof api[name] === "function") {
+        return api[name](...args);
+      }
+      await sleep(25);
     }
-    return api[name](...args);
+    throw new Error(`pywebview api.${name} unavailable`);
   }
 
   function setArmed(armed) {
@@ -354,7 +367,15 @@
   }
 
   function pastedPayload() {
-    return state.pasted.map(({ mime, data }) => ({ mime, data }));
+    const items = state.pasted.map(({ mime, data }) => ({ mime, data }));
+    // Huge stills over the pywebview bridge stall submit → leaveGently has
+    // already faded to a blank void and the HWND never hides. Cap hard.
+    const size = JSON.stringify(items).length;
+    if (size > 180000) {
+      console.warn(`dropping ${items.length} pasted still(s); bridge payload ${size} chars`);
+      return [];
+    }
+    return items;
   }
 
   async function submit() {
@@ -367,7 +388,13 @@
       if (!other) ids = ids.length ? ids : ["other"];
     }
     if (!ids.length) return;
-    await leaveGently();
+    // Hide the Win32 window first — leaveGently alone paints a blank card if
+    // submit/destroy stalls (seen with oversized clipboard JPEGs).
+    try {
+      await apiCall("closing");
+    } catch (_) {
+      /* older hosts */
+    }
     try {
       await apiCall("submit", ids, typed || null, pastedPayload());
     } catch (err) {
@@ -381,7 +408,11 @@
   }
 
   async function cancel(reason = "user cancelled") {
-    await leaveGently();
+    try {
+      await apiCall("closing");
+    } catch (_) {
+      /* ignore */
+    }
     try {
       await apiCall("cancel", reason);
     } catch (err) {
@@ -526,58 +557,80 @@
     const refs = document.getElementById("refs");
     const freeform = document.getElementById("freeform");
     const footer = document.querySelector(".footer");
-    let h = 28;
+    // Titlebar + breathing room; too-tight budgets clip OK/Cancel on scaled monitors.
+    let h = 36;
     [chrome, question, refs, freeform, footer].forEach((el) => {
       if (el && !el.hidden) h += el.offsetHeight;
     });
     if (banner && banner.classList.contains("is-on")) {
       h += banner.offsetHeight + 8;
     }
-    // Gaps in .body
-    h += 42;
+    // Gaps in .body + slack so the last option isn't flush with freeform.
+    h += 56;
     let optsH = 0;
     if (options) {
       options.querySelectorAll(".option").forEach((o) => {
         optsH += o.offsetHeight + 8;
       });
       // Scroll options beyond this — keep freeform + footer on screen.
-      h += Math.min(optsH, 420);
+      h += Math.min(optsH, 480);
     }
-    const w = Math.max(520, Math.min(760, window.outerWidth || 560));
-    apiCall("resize_to", w, Math.ceil(h)).catch(() => {});
+    const w = Math.max(560, Math.min(760, window.outerWidth || 600));
+    // Never ask the host for a window taller than the usable screen — laptop
+    // / scaled monitors used to clip OK/Cancel under the taskbar.
+    const avail = Math.max(
+      420,
+      Math.floor((window.screen && window.screen.availHeight) || 900) - 48,
+    );
+    apiCall("resize_to", w, Math.min(Math.ceil(h), avail)).catch(() => {});
+  }
+
+  function bridgeReady() {
+    if (window.__ASK_BRIDGE__) return true;
+    // pywebview sets api:{} early; methods appear only after finish.js _createApi.
+    const api = window.pywebview && window.pywebview.api;
+    return !!(api && typeof api.get_payload === "function");
   }
 
   async function boot() {
     const waitApi = () =>
       new Promise((resolve, reject) => {
+        let settled = false;
+        const done = (ok, err) => {
+          if (settled) return;
+          settled = true;
+          clearInterval(iv);
+          window.removeEventListener("pywebviewready", onReady);
+          if (ok) resolve();
+          else reject(err || new Error("dialog bridge unavailable (pywebview / Edge)"));
+        };
         const tryNow = () => {
-          if (window.__ASK_BRIDGE__) {
-            resolve();
-            return true;
-          }
-          if (window.pywebview && window.pywebview.api) {
-            resolve();
+          if (bridgeReady()) {
+            done(true);
             return true;
           }
           return false;
         };
+        const onReady = () => tryNow();
         if (tryNow()) return;
-        window.addEventListener("pywebviewready", () => tryNow());
+        window.addEventListener("pywebviewready", onReady);
         let n = 0;
         const iv = setInterval(() => {
           n += 1;
-          if (tryNow()) {
-            clearInterval(iv);
-            return;
-          }
-          if (n > 100) {
-            clearInterval(iv);
-            reject(new Error("dialog bridge unavailable (pywebview / Edge)"));
+          if (tryNow()) return;
+          // ~10s — WebView2 cold start under Cursor can be slow.
+          if (n > 200) {
+            done(false, new Error("dialog bridge unavailable (pywebview / Edge)"));
           }
         }, 50);
       });
 
     await waitApi();
+    try {
+      sessionStorage.removeItem("askq_boot_reloads");
+    } catch (_) {
+      /* ignore */
+    }
     apiCall("debug", "boot:api_ready").catch(() => {});
     const payload = await apiCall("get_payload");
     apiCall("debug", `boot:payload n=${(payload && payload.ids || []).length}`).catch(
@@ -589,8 +642,31 @@
 
   boot().catch((err) => {
     console.error(err);
-    document.body.innerHTML = `<pre style="color:#ff5c7a;padding:16px">${esc(
-      String(err),
-    )}</pre>`;
+    // Keep trying — a hard pink error page makes MCQs look "broken" when the
+    // bridge was only a beat late. Reload once after a short pause.
+    const msg = esc(String(err));
+    let reloads = 0;
+    try {
+      reloads = Number(sessionStorage.getItem("askq_boot_reloads") || "0") || 0;
+    } catch (_) {
+      /* ignore */
+    }
+    if (reloads < 2) {
+      try {
+        sessionStorage.setItem("askq_boot_reloads", String(reloads + 1));
+      } catch (_) {
+        /* ignore */
+      }
+      document.body.innerHTML = `<pre style="color:#ff5c7a;padding:16px">${msg}\n\nRetrying…</pre>`;
+      setTimeout(() => {
+        try {
+          location.reload();
+        } catch (_) {
+          /* ignore */
+        }
+      }, 400);
+      return;
+    }
+    document.body.innerHTML = `<pre style="color:#ff5c7a;padding:16px">${msg}</pre>`;
   });
 })();
